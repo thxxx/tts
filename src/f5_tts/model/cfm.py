@@ -99,13 +99,12 @@ class CFM(nn.Module):
         batch_size=1
     ):
         self.eval()
+        
         # raw wave
-
         if cond.ndim == 2:
             cond = self.mel_spec(cond)
             cond = cond.permute(0, 2, 1)
             assert cond.shape[-1] == self.num_channels
-
         cond = cond.to(next(self.parameters()).dtype)
 
         batch, cond_seq_len, device = *cond.shape[:2], cond.device
@@ -113,17 +112,14 @@ class CFM(nn.Module):
             lens = torch.full((batch,), cond_seq_len, device=device, dtype=torch.long)
 
         # text
-
         if isinstance(text, list):
             if exists(self.vocab_char_map):
                 text = list_str_to_idx(text, self.vocab_char_map).to(device)
             else:
                 text = list_str_to_tensor(text).to(device)
             
-            print("before text ", text.shape)
             if text.shape[0] != batch:
                 text = torch.tile(text, (batch_size, 1))
-            print("before text ", text.shape)
             # assert text.shape[0] == batch
 
         if exists(text):
@@ -165,19 +161,43 @@ class CFM(nn.Module):
             step_cond = torch.zeros_like(step_cond)
 
         # neural ode
-
         def fn(t, x):
             # at each step, conditioning is fixed
             # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
             # predict flow
-            pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False)
             if cfg_strength < 1e-5:
+                pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False)
                 return pred
+            else:
+                pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False)
+                null_pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=True, drop_text=True)
+                # # 2) null 예측용 입력 생성 (조건·텍스트를 0으로)
+                # zero_cond = torch.zeros_like(step_cond)
+                # zero_text = torch.zeros_like(text)
             
-            null_pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=True, drop_text=True)
-
-            return pred + cfg_strength * (pred - null_pred)
+                # # 3) 배치 차원으로 두 입력을 합침
+                # #    [원본; null] 형태로 (2B, ...)
+                # x_batched    = torch.cat([x,    x],    dim=0)
+                # cond_batched = torch.cat([step_cond, zero_cond], dim=0)
+                # text_batched = torch.cat([text, zero_text],      dim=0)
+                # # mask_batched = torch.cat([mask, mask],           dim=0)
+                
+                # # 4) 한 번만 transformer 호출
+                # out_batched = self.transformer(
+                #     x=x_batched,
+                #     cond=cond_batched,
+                #     text=text_batched,
+                #     time=t,         # 스칼라 t는 내부에서 broadcast 처리됨
+                #     mask=mask,
+                #     drop_audio_cond=False,
+                #     drop_text=False
+                # )
+            
+                # # 5) 다시 원래 배치 크기로 분리
+                # pred, null_pred = out_batched.chunk(2, dim=0)
+                
+                return pred + cfg_strength * (pred - null_pred)
 
         # noise input
         # to make sure batch inference result is same with different batch size, and for sure single inference
@@ -201,7 +221,14 @@ class CFM(nn.Module):
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
-        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        # main inference ode solver
+        trajectory = odeint(
+            fn, 
+            # torch.compile(fn), 
+            y0, 
+            t, 
+            **self.odeint_kwargs
+        )
 
         sampled = trajectory[-1]
         out = sampled
