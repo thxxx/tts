@@ -460,9 +460,7 @@ def infer_batch_process(
         with torch.inference_mode():
             if batch_size > 1 and audio.shape[0] == 1:
                 audio = torch.tile(audio, (batch_size, 1))
-                print("audio ", audio.shape)
 
-            print("before start : ", audio.shape, final_text_list, duration, nfe_step, duplicate_test, no_ref_audio, batch_size)
             generated, _ = model_obj.sample(
                 cond=audio,
                 text=final_text_list,

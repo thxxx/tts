@@ -8,4 +8,6 @@ pip install supabase
 pip install git+https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup
 pip install git+https://github.com/descriptinc/audiotools
 pip install jiwer ffprobe ffmpeg-python
-huggingface-cli login
+
+pip uninstall -y torchvision
+pip install -U transformers

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from random import random
 from typing import Callable
+from f5_tts.model.utils import convert_char_to_pinyin
 
 import torch
 import torch.nn.functional as F
@@ -52,8 +53,8 @@ class CFM(nn.Module):
         self.frac_lengths_mask = frac_lengths_mask
 
         # mel spec
-        self.mel_spec = default(mel_spec_module, MelSpec(**mel_spec_kwargs))
-        num_channels = default(num_channels, self.mel_spec.n_mel_channels)
+        self.mel_spec = MelSpec(**mel_spec_kwargs)
+        num_channels = self.mel_spec.n_mel_channels
         self.num_channels = num_channels
 
         # classifier-free guidance
@@ -81,16 +82,15 @@ class CFM(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        cond: float["b n d"] | float["b nw"],  # noqa: F722
-        text: int["b nt"] | list[str],  # noqa: F722
-        duration: int | int["b"],  # noqa: F821
+        reference_audio: float["b n d"] | float["b nw"],
+        text: int["b nt"] | list[str],
+        duration: int | int["b"],
         *,
-        lens: int["b"] | None = None,  # noqa: F821
         steps=32,
         cfg_strength=1.0,
         sway_sampling_coef=None,
         seed: int | None = None,
-        max_duration=4096,
+        max_duration=4096, # 약 40초
         vocoder: Callable[[float["b d n"]], float["b nw"]] | None = None,  # noqa: F722
         no_ref_audio=False,
         duplicate_test=False,
@@ -98,51 +98,31 @@ class CFM(nn.Module):
         edit_mask=None,
         batch_size=1
     ):
-        self.eval()
-        
         # raw wave
-        if cond.ndim == 2:
-            cond = self.mel_spec(cond)
-            cond = cond.permute(0, 2, 1)
-            assert cond.shape[-1] == self.num_channels
-        cond = cond.to(next(self.parameters()).dtype)
+        if reference_audio.ndim == 2:
+            reference_audio = self.mel_spec(reference_audio)
+            reference_audio = reference_audio.permute(0, 2, 1)
+            assert reference_audio.shape[-1] == self.num_channels
+        reference_audio = reference_audio.to(next(self.parameters()).dtype)
 
-        batch, cond_seq_len, device = *cond.shape[:2], cond.device
-        if not exists(lens):
-            lens = torch.full((batch,), cond_seq_len, device=device, dtype=torch.long)
+        cond_seq_len, device = reference_audio.shape[1], reference_audio.device
+        cond_length = torch.full((batch_size,), cond_seq_len, device=device, dtype=torch.long) # batch개의 텐서를 만들고, 값을 cond_seq_len으로 준다. 나중에 마스킹용으로 사용
 
-        # text
-        if isinstance(text, list):
-            if exists(self.vocab_char_map):
-                text = list_str_to_idx(text, self.vocab_char_map).to(device)
-            else:
-                text = list_str_to_tensor(text).to(device)
-            
-            if text.shape[0] != batch:
-                text = torch.tile(text, (batch_size, 1))
-            # assert text.shape[0] == batch
+        text = convert_char_to_pinyin(text)
+        text = list_str_to_idx(text, self.vocab_char_map).to(device)[0] # 이게 생성할 script의 indexes
+        print(len(text), cond_length)
+        condition_length = torch.maximum(len(text), cond_length) # condition의 최소 길이.
 
-        if exists(text):
-            text_lens = (text != -1).sum(dim=-1)
-            lens = torch.maximum(text_lens, lens)  # make sure lengths are at least those of the text characters
-        
         # duration
+        cond_mask = lens_to_mask(condition_length)
 
-        cond_mask = lens_to_mask(lens)
-        if edit_mask is not None:
-            cond_mask = cond_mask & edit_mask
-
-        if isinstance(duration, int):
-            duration = torch.full((batch,), duration, device=device, dtype=torch.long)
-
-        duration = torch.maximum(lens + 1, duration)  # just add one token so something is generated
+        duration = duration + cond_seq_len
+        duration = torch.tensor(duration, device=device, dtype=torch.long)
+        duration = torch.maximum(length + 1, duration)  # 당연히 duration이 더 커야한다.
         duration = duration.clamp(max=max_duration)
         max_duration = duration.amax()
 
-        # duplicate test corner for inner time step oberservation
-        if duplicate_test:
-            test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
-
+        # 앞은 reference audio mel이고, 뒤는 비어있는 컨디션 생성
         cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.0)
         cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False)
         cond_mask = cond_mask.unsqueeze(-1)
@@ -162,46 +142,15 @@ class CFM(nn.Module):
 
         # neural ode
         def fn(t, x):
-            # at each step, conditioning is fixed
-            # step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
-
-            # predict flow
             if cfg_strength < 1e-5:
                 pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False)
                 return pred
             else:
                 pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=False, drop_text=False)
                 null_pred = self.transformer(x=x, cond=step_cond, text=text, time=t, mask=mask, drop_audio_cond=True, drop_text=True)
-                # # 2) null 예측용 입력 생성 (조건·텍스트를 0으로)
-                # zero_cond = torch.zeros_like(step_cond)
-                # zero_text = torch.zeros_like(text)
-            
-                # # 3) 배치 차원으로 두 입력을 합침
-                # #    [원본; null] 형태로 (2B, ...)
-                # x_batched    = torch.cat([x,    x],    dim=0)
-                # cond_batched = torch.cat([step_cond, zero_cond], dim=0)
-                # text_batched = torch.cat([text, zero_text],      dim=0)
-                # # mask_batched = torch.cat([mask, mask],           dim=0)
-                
-                # # 4) 한 번만 transformer 호출
-                # out_batched = self.transformer(
-                #     x=x_batched,
-                #     cond=cond_batched,
-                #     text=text_batched,
-                #     time=t,         # 스칼라 t는 내부에서 broadcast 처리됨
-                #     mask=mask,
-                #     drop_audio_cond=False,
-                #     drop_text=False
-                # )
-            
-                # # 5) 다시 원래 배치 크기로 분리
-                # pred, null_pred = out_batched.chunk(2, dim=0)
                 
                 return pred + cfg_strength * (pred - null_pred)
 
-        # noise input
-        # to make sure batch inference result is same with different batch size, and for sure single inference
-        # still some difference maybe due to convolutional layers
         y0 = []
         for dur in duration:
             if exists(seed):
@@ -210,16 +159,10 @@ class CFM(nn.Module):
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
         t_start = 0
-
-        # duplicate test corner for inner time step oberservation
-        if duplicate_test:
-            t_start = t_inter
-            y0 = (1 - t_start) * y0 + t_start * test_cond
-            steps = int(steps * (1 - t_start))
-
         t = torch.linspace(t_start, 1, steps, device=self.device, dtype=step_cond.dtype)
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+        # t는 0~1까지 사이 값들. 한쪽에 몰릴 수는 있음.
 
         # main inference ode solver
         trajectory = odeint(
